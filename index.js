@@ -1,15 +1,3 @@
-/**
- * Bot de Discord para el AntiCheat de Roblox
- * ------------------------------------------------------------
- * - Servidor Express que recibe lotes de alertas desde Roblox (POST /alerts)
- *   protegido con una API key compartida.
- * - Convierte cada alerta en un embed (color y emoji según el tipo de check,
- *   avatar del jugador, enlace a su perfil) y lo manda al canal de alertas.
- * - Comandos slash: /estado, /alertas, /jugador
- *
- * Roblox -> POST https://TU-APP.onrender.com/alerts  (header x-api-key)
- */
-
 const crypto = require('node:crypto');
 const express = require('express');
 const {
@@ -26,8 +14,46 @@ const {
 } = require('discord.js');
 
 // ================== CONFIGURACIÓN ==================
-const { DISCORD_TOKEN, ALERT_CHANNEL_ID, GUILD_ID, API_KEY, PORT = 3000 } = process.env;
+const { DISCORD_TOKEN, API_KEY, PORT = 3000 } = process.env;
 const DRY_RUN = process.env.DRY_RUN === '1';
+
+function parseList(value) {
+  return String(value ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// Servidores de Discord donde se registran los comandos (acepta también GUILD_ID suelto)
+const GUILD_IDS = parseList(process.env.GUILD_IDS || process.env.GUILD_ID);
+
+// Canales de destino por defecto: reciben las alertas de TODOS los juegos
+// que no tengan una ruta propia (acepta también ALERT_CHANNEL_ID suelto)
+const DEFAULT_CHANNEL_IDS = parseList(process.env.ALERT_CHANNEL_IDS || process.env.ALERT_CHANNEL_ID);
+
+// Rutas opcionales por juego (placeId -> canales). Ejemplo en Render:
+//   GAME_ROUTES={"123456789":["canalA"],"987654321":["canalB","canalC"]}
+// Si el placeId de la alerta tiene ruta, va SOLO a esos canales.
+function parseGameRoutes() {
+  const raw = process.env.GAME_ROUTES;
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    const routes = {};
+    for (const [placeId, value] of Object.entries(parsed)) {
+      routes[String(placeId)] = (Array.isArray(value) ? value : parseList(value)).map(String);
+    }
+    return routes;
+  } catch {
+    console.error('GAME_ROUTES no es un JSON válido. Ejemplo: {"123456789":["idCanal"]}');
+    process.exit(1);
+  }
+}
+const GAME_ROUTES = parseGameRoutes();
+
+function channelsFor(placeId) {
+  return GAME_ROUTES[String(placeId)] ?? DEFAULT_CHANNEL_IDS;
+}
 
 const MAX_HISTORY = 300;           // alertas guardadas en memoria (se pierden al reiniciar)
 const MAX_ALERTS_PER_REQUEST = 25; // tope por petición de Roblox
@@ -38,8 +64,9 @@ if (!API_KEY) {
   console.error('Falta la variable API_KEY. Revisa .env.example');
   process.exit(1);
 }
-if (!DRY_RUN && (!DISCORD_TOKEN || !ALERT_CHANNEL_ID || !GUILD_ID)) {
-  console.error('Faltan DISCORD_TOKEN, ALERT_CHANNEL_ID o GUILD_ID. Revisa .env.example');
+const hasAnyChannel = DEFAULT_CHANNEL_IDS.length > 0 || Object.keys(GAME_ROUTES).length > 0;
+if (!DRY_RUN && (!DISCORD_TOKEN || GUILD_IDS.length === 0 || !hasAnyChannel)) {
+  console.error('Faltan DISCORD_TOKEN, GUILD_IDS o canales (ALERT_CHANNEL_IDS / GAME_ROUTES). Revisa .env.example');
   process.exit(1);
 }
 
@@ -57,6 +84,12 @@ const DEFAULT_STYLE = { color: 0x95a5a6, emoji: '⚠️' };
 const history = [];
 const stats = { received: 0, lastSent: null };
 const avatarCache = new Map();
+const channelGuild = new Map(); // channelId -> guildId (para que cada servidor vea solo lo suyo)
+
+// Alertas que le corresponden a un servidor de Discord (según los canales a los que se enviaron)
+function visibleHistory(guildId) {
+  return history.filter((a) => a.channelIds.some((id) => channelGuild.get(id) === guildId));
+}
 
 // ================== UTILIDADES ==================
 function clip(value, max) {
@@ -133,7 +166,9 @@ function buildEmbed(alert) {
       { name: 'Jugador', value: player, inline: true },
       { name: 'UserId', value: `\`${alert.userId}\``, inline: true },
     )
-    .setFooter({ text: `Servidor ${alert.server}` })
+    .setFooter({
+      text: `Servidor ${alert.server}${alert.placeId ? ` · Place ${alert.placeId}` : ''}`,
+    })
     .setTimestamp(new Date(alert.time));
 
   const avatar = avatarCache.get(alert.userId);
@@ -144,7 +179,18 @@ function buildEmbed(alert) {
 // ================== ENVÍO A DISCORD ==================
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-async function deliver(alerts) {
+async function sendToChannel(channelId, embeds) {
+  const channel = await client.channels.fetch(channelId);
+  channelGuild.set(channelId, channel.guildId);
+  for (let i = 0; i < embeds.length; i += EMBEDS_PER_MESSAGE) {
+    await channel.send({
+      embeds: embeds.slice(i, i + EMBEDS_PER_MESSAGE),
+      allowedMentions: { parse: [] }, // nunca mencionar a nadie por un nombre raro
+    });
+  }
+}
+
+async function deliver(alerts, channelIds) {
   // Primero los avatares (una sola consulta por jugador distinto)
   const uniqueIds = [...new Set(alerts.map((a) => a.userId))];
   await Promise.all(uniqueIds.map(getAvatar));
@@ -152,20 +198,25 @@ async function deliver(alerts) {
   const embeds = alerts.map(buildEmbed);
 
   if (DRY_RUN) {
-    console.log('[DRY_RUN] Embeds que se enviarían:');
+    console.log(`[DRY_RUN] Canales de destino: ${channelIds.join(', ') || '(ninguno)'}`);
     console.log(JSON.stringify(embeds.map((e) => e.toJSON()), null, 2));
     stats.lastSent = Date.now();
     return;
   }
 
-  const channel = await client.channels.fetch(ALERT_CHANNEL_ID);
-  for (let i = 0; i < embeds.length; i += EMBEDS_PER_MESSAGE) {
-    await channel.send({
-      embeds: embeds.slice(i, i + EMBEDS_PER_MESSAGE),
-      allowedMentions: { parse: [] }, // nunca mencionar a nadie por un nombre raro
-    });
+  if (channelIds.length === 0) {
+    console.warn('Alerta sin canal de destino (revisa ALERT_CHANNEL_IDS / GAME_ROUTES).');
+    return;
   }
-  stats.lastSent = Date.now();
+
+  // Un canal que falle (permisos, borrado) no debe impedir el envío a los demás
+  const results = await Promise.allSettled(channelIds.map((id) => sendToChannel(id, embeds)));
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') {
+      console.error(`No se pudo enviar al canal ${channelIds[i]}:`, r.reason?.message ?? r.reason);
+    }
+  });
+  if (results.some((r) => r.status === 'fulfilled')) stats.lastSent = Date.now();
 }
 
 // ================== SERVIDOR HTTP (lo que llama Roblox) ==================
@@ -188,11 +239,16 @@ app.post('/alerts', (req, res) => {
   const server = jobId || 'Studio';
   const now = Date.now();
 
+  // placeId identifica el juego; decide a qué canales va (ver GAME_ROUTES)
+  const rawPlaceId = Number(body.placeId);
+  const placeId = Number.isInteger(rawPlaceId) && rawPlaceId > 0 ? rawPlaceId : 0;
+  const channelIds = channelsFor(placeId);
+
   const alerts = body.alerts
     .slice(0, MAX_ALERTS_PER_REQUEST)
     .map(sanitizeAlert)
     .filter(Boolean)
-    .map((a) => ({ ...a, server, time: now }));
+    .map((a) => ({ ...a, server, placeId, channelIds, time: now }));
 
   if (alerts.length === 0) {
     return res.status(400).json({ error: 'ninguna alerta válida' });
@@ -204,7 +260,7 @@ app.post('/alerts', (req, res) => {
 
   // Responder rápido a Roblox; el envío a Discord ocurre aparte
   res.status(202).json({ accepted: alerts.length });
-  deliver(alerts).catch((err) => console.error('Error enviando a Discord:', err));
+  deliver(alerts, channelIds).catch((err) => console.error('Error enviando a Discord:', err));
 });
 
 // JSON mal formado u otros errores de Express
@@ -250,6 +306,8 @@ function alertLine(a) {
 async function handleInteraction(interaction) {
   if (!interaction.isChatInputCommand()) return;
   const ephemeral = { flags: MessageFlags.Ephemeral };
+  // Cada servidor solo ve las alertas que se enviaron a sus propios canales
+  const visible = visibleHistory(interaction.guildId);
 
   if (interaction.commandName === 'estado') {
     const embed = new EmbedBuilder()
@@ -258,8 +316,8 @@ async function handleInteraction(interaction) {
       .addFields(
         { name: 'Tiempo activo', value: `${Math.round(process.uptime() / 60)} min`, inline: true },
         { name: 'Latencia Discord', value: `${client.ws.ping} ms`, inline: true },
-        { name: 'Alertas recibidas', value: String(stats.received), inline: true },
-        { name: 'En memoria', value: String(history.length), inline: true },
+        { name: 'Alertas recibidas (total)', value: String(stats.received), inline: true },
+        { name: 'En memoria (este servidor)', value: String(visible.length), inline: true },
         {
           name: 'Último envío',
           value: stats.lastSent ? `<t:${Math.floor(stats.lastSent / 1000)}:R>` : 'ninguno aún',
@@ -271,7 +329,7 @@ async function handleInteraction(interaction) {
 
   if (interaction.commandName === 'alertas') {
     const count = interaction.options.getInteger('cantidad') ?? 8;
-    const last = history.slice(-count).reverse();
+    const last = visible.slice(-count).reverse();
     if (last.length === 0) {
       return interaction.reply({ content: 'Todavía no hay alertas guardadas.', ...ephemeral });
     }
@@ -284,7 +342,7 @@ async function handleInteraction(interaction) {
 
   if (interaction.commandName === 'jugador') {
     const query = interaction.options.getString('busqueda').trim().toLowerCase();
-    const matches = history.filter(
+    const matches = visible.filter(
       (a) => String(a.userId) === query || a.name.toLowerCase().includes(query),
     );
     if (matches.length === 0) {
@@ -312,13 +370,27 @@ async function handleInteraction(interaction) {
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`Bot conectado como ${c.user.tag}`);
-  try {
-    const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-    // Comandos de servidor: aparecen al instante (los globales tardan)
-    await rest.put(Routes.applicationGuildCommands(c.user.id, GUILD_ID), { body: commands });
-    console.log('Comandos slash registrados.');
-  } catch (err) {
-    console.error('No se pudieron registrar los comandos:', err);
+
+  // Averiguar a qué servidor pertenece cada canal configurado
+  const configuredChannels = new Set([...DEFAULT_CHANNEL_IDS, ...Object.values(GAME_ROUTES).flat()]);
+  for (const channelId of configuredChannels) {
+    try {
+      const channel = await client.channels.fetch(channelId);
+      channelGuild.set(channelId, channel.guildId);
+    } catch (err) {
+      console.error(`No se pudo leer el canal ${channelId} (¿el bot está en ese servidor y lo ve?):`, err.message);
+    }
+  }
+
+  // Registrar los comandos en cada servidor (aparecen al instante; los globales tardan)
+  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+  for (const guildId of GUILD_IDS) {
+    try {
+      await rest.put(Routes.applicationGuildCommands(c.user.id, guildId), { body: commands });
+      console.log(`Comandos slash registrados en el servidor ${guildId}.`);
+    } catch (err) {
+      console.error(`No se pudieron registrar los comandos en ${guildId}:`, err.message);
+    }
   }
 });
 
