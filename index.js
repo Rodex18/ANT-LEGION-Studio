@@ -179,6 +179,7 @@ function buildEmbed(alert) {
 // ================== ENVÍO A DISCORD ==================
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+
 async function sendToChannel(channelId, embeds) {
   const channel = await client.channels.fetch(channelId);
 
@@ -198,13 +199,6 @@ async function sendToChannel(channelId, embeds) {
     await channel.send({
       embeds: embeds.slice(i, i + EMBEDS_PER_MESSAGE),
       allowedMentions: { parse: [] },
-    });
-  }
-}
-  for (let i = 0; i < embeds.length; i += EMBEDS_PER_MESSAGE) {
-    await channel.send({
-      embeds: embeds.slice(i, i + EMBEDS_PER_MESSAGE),
-      allowedMentions: { parse: [] }, // nunca mencionar a nadie por un nombre raro
     });
   }
 }
