@@ -1,0 +1,17 @@
+{
+  "name": "anticheat-discord-bot",
+  "version": "1.0.0",
+  "description": "Bot de Discord que recibe alertas del anticheat de Roblox y las muestra como embeds",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --env-file=.env index.js"
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "express": "^4.21.0"
+  }
+}
